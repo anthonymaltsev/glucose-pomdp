@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import torch
+from torch import Tensor
 
 
 @dataclass(frozen=True)
@@ -24,8 +26,19 @@ class PatientState:
     """State snapshot summarizing a patient's partially observed glucose status."""
 
     timestamp: pd.Timestamp
-    features: Dict[str, float]
+    features: Tensor
     metadata: Dict[str, float | int | str | bool] = field(default_factory=dict)
+
+
+@dataclass
+class Transition:
+    """(state, action, reward, next_state) tuple used for learning."""
+
+    state: PatientState
+    action: ActionSpec | None
+    reward: float
+    next_state: PatientState
+    info: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -38,10 +51,37 @@ class PatientTrajectory:
     los_icu_days: float
     first_icu_stay: bool
     states: List[PatientState]
+    actions: List[ActionSpec] = field(default_factory=list)
+
+    def iter_transitions(
+        self,
+        action_resolver: Callable[[PatientState, PatientState], ActionSpec | None] | None = None,
+        reward_fn: Callable[[PatientState, ActionSpec | None, PatientState], float] | None = None,
+        default_reward: float = 0.0,
+    ) -> Iterator[Transition]:
+        if len(self.states) < 2:
+            return
+        for idx, (curr, nxt) in enumerate(zip(self.states, self.states[1:])):
+            action = self.actions[idx] if idx < len(self.actions) else None
+            if action_resolver:
+                action = action_resolver(curr, nxt)
+            reward = float(reward_fn(curr, action, nxt)) if reward_fn else float(default_reward)
+            yield Transition(state=curr, action=action, reward=reward, next_state=nxt)
 
 
-class PatientStateDataset(Iterable[PatientTrajectory]):
-    """Builds VOI-ready patient state trajectories from glucose/insulin ICU events."""
+class PatientStateDataset(Iterable[Transition]):
+    """Builds VOI-ready patient state trajectories and transitions from ICU events."""
+
+    FEATURE_NAMES: Tuple[str, ...] = (
+        "glucose_last",
+        "glucose_mean",
+        "glucose_std",
+        "glucose_min",
+        "glucose_max",
+        "glucose_trend_mgdl_per_hr",
+        "time_in_range_frac",
+        "time_since_last_measurement_min",
+    )
 
     ACTION_SPACE: Tuple[ActionSpec, ...] = (
         ActionSpec(
@@ -70,11 +110,14 @@ class PatientStateDataset(Iterable[PatientTrajectory]):
     def __init__(
         self,
         csv_path: Path | str,
-        *,
         resample_freq: str = "15min",
         history_window: str | None = None,
         intervention_horizon: str = "1h",
         time_in_range: Tuple[int, int] = (70, 180),
+        feature_dtype: torch.dtype = torch.float32,
+        default_reward: float = 0.0,
+        action_resolver: Callable[[PatientState, PatientState], ActionSpec | None] | None = None,
+        reward_fn: Callable[[PatientState, ActionSpec | None, PatientState], float] | None = None,
     ) -> None:
         self.csv_path = Path(csv_path)
         self.resample_freq = pd.Timedelta(resample_freq)
@@ -83,6 +126,11 @@ class PatientStateDataset(Iterable[PatientTrajectory]):
         )
         self.intervention_horizon = pd.Timedelta(intervention_horizon)
         self.time_in_range_bounds = time_in_range
+        self.feature_dtype = feature_dtype
+        self.default_reward = default_reward
+        self.action_resolver = action_resolver
+        self.reward_fn = reward_fn
+        self._action_lookup = {action.name: action for action in self.ACTION_SPACE}
 
         if not self.csv_path.exists():
             raise FileNotFoundError(f"Dataset not found: {self.csv_path}")
@@ -93,12 +141,27 @@ class PatientStateDataset(Iterable[PatientTrajectory]):
         self._events = pd.read_csv(self.csv_path, parse_dates=parse_dates)
         self._normalize_columns()
 
-    def __iter__(self) -> Iterator[PatientTrajectory]:
-        for _, stay_df in self._events.groupby(["SUBJECT_ID", "HADM_ID", "ICUSTAY_ID"], sort=False):
-            yield self._build_trajectory(stay_df.copy())
+    def __iter__(self) -> Iterator[Transition]:
+        for trajectory in self.iter_trajectories():
+            yield from trajectory.iter_transitions(
+                action_resolver=self.action_resolver,
+                reward_fn=self.reward_fn,
+                default_reward=self.default_reward,
+            )
 
     def get_action_space(self) -> Tuple[ActionSpec, ...]:
         return self.ACTION_SPACE
+
+    def iter_trajectories(self) -> Iterator[PatientTrajectory]:
+        """Yield full trajectories for each ICU stay."""
+        for _, stay_df in self._events.groupby(["SUBJECT_ID", "HADM_ID", "ICUSTAY_ID"], sort=False):
+            yield self._build_trajectory(stay_df.copy())
+
+    def feature_names(self) -> Tuple[str, ...]:
+        return self.FEATURE_NAMES
+
+    def _action_by_name(self, name: str) -> ActionSpec:
+        return self._action_lookup[name]
 
     # -------------------------------------------------------------------------
     # Internal helpers
@@ -141,14 +204,14 @@ class PatientStateDataset(Iterable[PatientTrajectory]):
 
         for ts in timeline:
             if self.history_window is None:
-                window_series = glucose_events.loc[: ts]
+                window_series = glucose_events.loc[: ts, "value"]
             else:
                 window_start = ts - self.history_window
-                window_series = glucose_events.loc[window_start:ts]
+                window_series = glucose_events.loc[window_start:ts, "value"]
 
             while glucose_idx < glucose_len and glucose_times[glucose_idx] <= ts:
                 last_measurement_time = glucose_times[glucose_idx]
-                last_measurement_value = float(glucose_events.iloc[glucose_idx])
+                last_measurement_value = float(glucose_events.iloc[glucose_idx]["value"])
                 glucose_idx += 1
 
             time_since_last = (
@@ -157,7 +220,11 @@ class PatientStateDataset(Iterable[PatientTrajectory]):
 
             features = self._compute_features(window_series, last_measurement_value, time_since_last)
             metadata = self._compute_metadata(insulin_events, ts)
+            if ts in glucose_events.index:
+                metadata["measurement_source"] = str(glucose_events.loc[ts, "source"])
+                metadata["measurement_value"] = float(glucose_events.loc[ts, "value"])
             states.append(PatientState(timestamp=ts, features=features, metadata=metadata))
+        interval_actions = self._label_interval_actions(timeline, glucose_events)
 
         return PatientTrajectory(
             subject_id=subject_id,
@@ -166,6 +233,7 @@ class PatientStateDataset(Iterable[PatientTrajectory]):
             los_icu_days=los_icu_days,
             first_icu_stay=first_stay,
             states=states,
+            actions=interval_actions,
         )
 
     def _build_timeline(self, timestamps: pd.Series) -> pd.DatetimeIndex:
@@ -175,15 +243,21 @@ class PatientStateDataset(Iterable[PatientTrajectory]):
             end = start + self.resample_freq
         return pd.date_range(start=start, end=end, freq=self.resample_freq)
 
-    def _extract_glucose_series(self, stay_df: pd.DataFrame) -> pd.Series:
+    def _extract_glucose_series(self, stay_df: pd.DataFrame) -> pd.DataFrame:
         glc_df = stay_df.dropna(subset=["GLC"]).copy()
         if glc_df.empty:
-            return pd.Series(dtype=float)
+            return pd.DataFrame(columns=["value", "source"])
         timestamps = pd.to_datetime(glc_df["GLCTIMER"].fillna(glc_df["TIMER"]), errors="coerce", utc=True)
         timestamps = timestamps.dt.tz_localize(None)
-        series = pd.Series(glc_df["GLC"].values, index=timestamps)
-        series = series[~series.index.duplicated(keep="last")]
-        return series.sort_index()
+        data = pd.DataFrame(
+            {
+                "value": glc_df["GLC"].values,
+                "source": glc_df["GLCSOURCE"].fillna("Unknown").values,
+            },
+            index=timestamps,
+        )
+        data = data[~data.index.duplicated(keep="last")]
+        return data.sort_index()
 
     def _extract_insulin_events(self, stay_df: pd.DataFrame) -> pd.DataFrame:
         insulin_mask = stay_df["INPUT"].notna() | stay_df["EVENT"].notna()
@@ -200,10 +274,10 @@ class PatientStateDataset(Iterable[PatientTrajectory]):
         window_series: pd.Series,
         last_measurement_value: float,
         time_since_last: float,
-    ) -> Dict[str, float]:
+    ) -> Tensor:
         if window_series.empty:
-            return {
-                "glucose_last": last_measurement_value,
+            stats = {
+                "glucose_last": float(last_measurement_value),
                 "glucose_mean": np.nan,
                 "glucose_std": np.nan,
                 "glucose_min": np.nan,
@@ -212,25 +286,28 @@ class PatientStateDataset(Iterable[PatientTrajectory]):
                 "time_in_range_frac": np.nan,
                 "time_since_last_measurement_min": time_since_last,
             }
+        else:
+            time_delta_hours = (window_series.index[-1] - window_series.index[0]).total_seconds() / 3600
+            glucose_trend = np.nan
+            if time_delta_hours > 0:
+                glucose_trend = (window_series.iloc[-1] - window_series.iloc[0]) / time_delta_hours
 
-        time_delta_hours = (window_series.index[-1] - window_series.index[0]).total_seconds() / 3600
-        glucose_trend = np.nan
-        if time_delta_hours > 0:
-            glucose_trend = (window_series.iloc[-1] - window_series.iloc[0]) / time_delta_hours
+            lower, upper = self.time_in_range_bounds
+            time_in_range_frac = float((window_series.between(lower, upper)).mean())
 
-        lower, upper = self.time_in_range_bounds
-        time_in_range_frac = float((window_series.between(lower, upper)).mean())
+            stats = {
+                "glucose_last": float(window_series.iloc[-1]),
+                "glucose_mean": float(window_series.mean()),
+                "glucose_std": float(window_series.std(ddof=0)),
+                "glucose_min": float(window_series.min()),
+                "glucose_max": float(window_series.max()),
+                "glucose_trend_mgdl_per_hr": float(glucose_trend),
+                "time_in_range_frac": time_in_range_frac,
+                "time_since_last_measurement_min": time_since_last,
+            }
 
-        return {
-            "glucose_last": float(window_series.iloc[-1]),
-            "glucose_mean": float(window_series.mean()),
-            "glucose_std": float(window_series.std(ddof=0)),
-            "glucose_min": float(window_series.min()),
-            "glucose_max": float(window_series.max()),
-            "glucose_trend_mgdl_per_hr": float(glucose_trend),
-            "time_in_range_frac": time_in_range_frac,
-            "time_since_last_measurement_min": time_since_last,
-        }
+        values = [stats[name] for name in self.FEATURE_NAMES]
+        return torch.tensor(values, dtype=self.feature_dtype)
 
     def _compute_metadata(
         self, insulin_events: pd.DataFrame, ts: pd.Timestamp
@@ -267,11 +344,37 @@ class PatientStateDataset(Iterable[PatientTrajectory]):
             "recent_event_kind": str(last_event.get("EVENT", "Unknown")),
         }
 
+    def _label_interval_actions(
+        self, timeline: pd.DatetimeIndex, glucose_events: pd.DataFrame
+    ) -> List[ActionSpec]:
+        """Assign an action to each interval based on measurements."""
+        if len(timeline) < 2:
+            return []
+        actions: List[ActionSpec] = []
+        if glucose_events.empty:
+            return [self._action_by_name("wait")] * (len(timeline) - 1)
+
+        idx = glucose_events.index
+        for start, end in zip(timeline[:-1], timeline[1:]):
+            mask = (idx > start) & (idx <= end)
+            if not mask.any():
+                actions.append(self._action_by_name("wait"))
+                continue
+
+            sources = glucose_events.loc[idx[mask], "source"].astype(str).str.upper()
+            if sources.str.contains("BLOOD").any() or sources.str.contains("LAB").any():
+                actions.append(self._action_by_name("lab_test"))
+            else:
+                actions.append(self._action_by_name("finger_prick"))
+
+        return actions
+
 
 __all__ = [
     "ActionSpec",
     "PatientState",
     "PatientTrajectory",
+    "Transition",
     "PatientStateDataset",
 ]
 
