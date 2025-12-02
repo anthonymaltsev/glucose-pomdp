@@ -2,17 +2,23 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from patient_dataset import PatientStateDataset
+from patient_dataset import PatientStateDataset, PatientTrajectory
 from rewards import SimpleReward
 from simulator import GlucoseEnvironment
-from policies import GreedyPolicy, ThresholdPolicy, UncertaintyPolicy, MyopicVOIPolicy
+from policies import (
+    GreedyPolicy,
+    HistoricalPolicy,
+    MyopicVOIPolicy,
+    ThresholdPolicy,
+    UncertaintyPolicy,
+)
 
 
 def run_policy_on_trajectory(
     policy,
-    trajectory,
+    trajectory: PatientTrajectory,
     reward_fn,
-    dataset,
+    dataset: PatientStateDataset,
     verbose: bool = False,
 ):
     """
@@ -29,6 +35,9 @@ def run_policy_on_trajectory(
         Dictionary with episode statistics
     """
     env = GlucoseEnvironment(trajectory, reward_fn)
+    # Reset any internal policy state between episodes
+    if hasattr(policy, "reset"):
+        policy.reset()
     state = env.reset()
 
     total_reward = 0.0
@@ -64,7 +73,8 @@ def run_policy_on_trajectory(
 
 def main() -> None:
     # Setup
-    dataset_dir = Path(__file__).parent / "data" / "physionet.org" / "files" / "glucose-management-mimic" / "1.0.1" / "Datasets"
+    # dataset_dir = Path(__file__).parent / "data" / "physionet.org" / "files" / "glucose-management-mimic" / "1.0.1" / "Datasets"
+    dataset_dir = Path(__file__).parent / "data" / "Datasets"
     csv_path = dataset_dir / "glucose_insulin_ICU.csv"
 
     print("=" * 60)
@@ -81,52 +91,80 @@ def main() -> None:
     dataset = PatientStateDataset(csv_path, reward_fn=reward_fn)
     print(f"   ✓ Dataset loaded from {csv_path}")
 
-    # Get one trajectory for testing
-    print("\n3. Getting sample trajectory...")
-    trajectory_iter = dataset.iter_trajectories()
-    trajectory = next(trajectory_iter)
-    print(f"   ✓ Trajectory loaded:")
-    print(f"     - Subject ID: {trajectory.subject_id}")
-    print(f"     - ICU Stay ID: {trajectory.icustay_id}")
-    print(f"     - Length of stay: {trajectory.los_icu_days:.1f} days")
-    print(f"     - Number of states: {len(trajectory.states)}")
-
-    # Create policies
-    print("\n4. Creating policies...")
-    policies = [
-        ("Greedy (always wait)", GreedyPolicy(dataset.get_action_space())),
-        ("Threshold (4hr)", ThresholdPolicy(time_threshold_minutes=240)),
-        ("Threshold (2hr)", ThresholdPolicy(time_threshold_minutes=120)),
-        ("Uncertainty", UncertaintyPolicy(std_threshold=30, time_threshold_minutes=180)),
-        ("Myopic VOI", MyopicVOIPolicy(info_gain_weight=1.5)),
+    # Create policy factories so we can build a fresh policy per trajectory.
+    print("\n3. Creating policies...")
+    policy_factories = [
+        ("Greedy (always wait)", lambda ds, traj: GreedyPolicy(ds.get_action_space())),
+        # ("Threshold (4hr)", lambda ds, traj: ThresholdPolicy(time_threshold_minutes=240)),
+        # ("Threshold (2hr)", lambda ds, traj: ThresholdPolicy(time_threshold_minutes=120)),
+        # (
+        #     "Uncertainty",
+        #     lambda ds, traj: UncertaintyPolicy(std_threshold=30, time_threshold_minutes=180),
+        # ),
+        # ("Myopic VOI", lambda ds, traj: MyopicVOIPolicy(info_gain_weight=1.5)),
+        ("Historical", lambda ds, traj: HistoricalPolicy(traj)),
     ]
-    print(f"   ✓ Created {len(policies)} policies")
+    print(f"   ✓ Created {len(policy_factories)} policy definitions")
 
-    # Test each policy
-    print("\n5. Running policies on trajectory...")
+    # Initialize results storage for all trajectories
+    print("\n4. Running policies on all trajectories...")
     print("-" * 60)
+    
+    # Store aggregated results for each policy
+    policy_results = {
+        name: {
+            "total_rewards": [],
+            "total_measurements": [],
+            "total_waits": [],
+            "episode_lengths": [],
+            "avg_rewards": [],
+        }
+        for name, _ in policy_factories
+    }
+    
+    trajectory_iter = dataset.iter_trajectories()
+    trajectory_count = 0
+    
+    # Process all trajectories
+    for trajectory in trajectory_iter:
+        trajectory_count += 1
+        
+        # Run each policy on this trajectory
+        for name, factory in policy_factories:
+            policy = factory(dataset, trajectory)
+            stats = run_policy_on_trajectory(policy, trajectory, reward_fn, dataset, verbose=False)
+            
+            # Accumulate statistics
+            policy_results[name]['total_rewards'].append(stats['total_reward'])
+            policy_results[name]['total_measurements'].append(stats['num_measurements'])
+            policy_results[name]['total_waits'].append(stats['num_waits'])
+            policy_results[name]['episode_lengths'].append(stats['length'])
+            policy_results[name]['avg_rewards'].append(stats['avg_reward'])
+        
+        # Print progress every 100 iterations
+        if trajectory_count % 100 == 0:
+            print(f"  Processed {trajectory_count} trajectories...")
+        if trajectory_count == 100:
+            print("Stopping at 10 trajectories...")
+            break
+    
+    print(f"   ✓ Completed processing {trajectory_count} trajectories")
 
-    results = []
-    for name, policy in policies:
-        stats = run_policy_on_trajectory(policy, trajectory, reward_fn, dataset, verbose=False)
-        results.append((name, stats))
-
-        print(f"\n{name}:")
-        print(f"  Total reward:     {stats['total_reward']:>8.2f}")
-        print(f"  Episode length:   {stats['length']:>8} steps")
-        print(f"  Avg reward/step:  {stats['avg_reward']:>8.3f}")
-        print(f"  Measurements:     {stats['num_measurements']:>8}")
-        print(f"  Wait actions:     {stats['num_waits']:>8}")
-        print(f"  Action breakdown: {stats['action_counts']}")
-
-    # Summary comparison
+    # Summary comparison across all trajectories
     print("\n" + "=" * 60)
-    print("Summary Comparison")
+    print("Summary Comparison (Across All Trajectories)")
     print("=" * 60)
-    print(f"{'Policy':<20} {'Total Reward':>15} {'Measurements':>15}")
-    print("-" * 60)
-    for name, stats in results:
-        print(f"{name:<20} {stats['total_reward']:>15.2f} {stats['num_measurements']:>15}")
+    print(f"{'Policy':<25} {'Avg Reward':>15} {'Total Reward':>15} {'Avg Measurements':>18} {'Total Measurements':>20}")
+    print("-" * 100)
+    
+    for name, _ in policy_factories:
+        results = policy_results[name]
+        avg_reward = sum(results['total_rewards']) / len(results['total_rewards']) if results['total_rewards'] else 0
+        total_reward = sum(results['total_rewards'])
+        avg_measurements = sum(results['total_measurements']) / len(results['total_measurements']) if results['total_measurements'] else 0
+        total_measurements = sum(results['total_measurements'])
+        
+        print(f"{name:<25} {avg_reward:>15.2f} {total_reward:>15.2f} {avg_measurements:>18.2f} {total_measurements:>20}")
 
     print("\n✓ Phase 1 implementation complete!")
     print("\nYou can now:")

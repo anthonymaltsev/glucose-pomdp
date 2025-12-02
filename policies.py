@@ -5,7 +5,7 @@ from typing import Tuple
 
 import numpy as np
 
-from patient_dataset import PatientState, ActionSpec
+from patient_dataset import ActionSpec, PatientState, PatientTrajectory
 
 
 class Policy(ABC):
@@ -32,6 +32,50 @@ class Policy(ABC):
     def reset(self) -> None:
         """Reset policy state (for stateful policies)."""
         pass
+
+
+class HistoricalPolicy(Policy):
+    """
+    Policy that replays the historical (logged) actions for a trajectory.
+
+    This serves as a ground-truth / behavior policy for comparison: at each
+    decision step it returns the action that was actually taken in the data.
+    """
+
+    def __init__(self, trajectory: PatientTrajectory):
+        """
+        Initialize with a specific patient trajectory.
+
+        Args:
+            trajectory: Trajectory whose logged actions will be replayed.
+        """
+        self._actions = list(trajectory.actions)
+        self._idx = 0
+
+    def reset(self) -> None:
+        """Restart from the beginning of the trajectory."""
+        self._idx = 0
+
+    def select_action(
+        self,
+        state: PatientState,  # noqa: ARG002 (unused – kept for interface compatibility)
+        action_space: Tuple[ActionSpec, ...],
+    ) -> ActionSpec:
+        """
+        Return the logged action for the current step.
+
+        If the trajectory has fewer logged actions than states, fall back to
+        a no-op wait action for any extra steps.
+        """
+        if self._idx < len(self._actions):
+            action = self._actions[self._idx]
+        else:
+            # Fallback: if we run past the logged actions, treat as "wait".
+            wait_actions = [a for a in action_space if a.name == "wait"]
+            action = wait_actions[0] if wait_actions else action_space[0]
+
+        self._idx += 1
+        return action
 
 
 class GreedyPolicy(Policy):
@@ -239,6 +283,7 @@ class MyopicVOIPolicy(Policy):
 
 __all__ = [
     "Policy",
+    "HistoricalPolicy",
     "GreedyPolicy",
     "ThresholdPolicy",
     "UncertaintyPolicy",
