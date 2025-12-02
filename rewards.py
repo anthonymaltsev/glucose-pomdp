@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+import pandas as pd
 
 from patient_dataset import PatientState, ActionSpec
 
@@ -33,8 +34,14 @@ class RewardConfig:
     use_uncertainty_penalty: bool = True
     uncertainty_time_threshold: float = 120.0  # 2 hours in minutes
     uncertainty_time_coeff: float = -2.0  # Stronger penalty for staleness
-    uncertainty_variability_coeff: float = -1.5  # Stronger penalty for variability
-    uncertainty_variability_threshold: float = 30.0
+    uncertainty_variability_coeff: float = -1.0  # Stronger penalty for variability
+    uncertainty_variability_threshold: float = 50.0
+
+    # Treatment/intervention monitoring penalty
+    # Penalize not measuring around the time of insulin/treatment events.
+    use_treatment_penalty: bool = True
+    treatment_window_minutes: float = 60.0
+    treatment_no_measure_penalty: float = -1000.0
 
 
 class SimpleReward:
@@ -46,10 +53,17 @@ class SimpleReward:
     2. Glycemic safety (patient outcomes)
     3. Quality of control (time-in-range)
     4. Uncertainty penalty (value of information)
+    5. Treatment monitoring penalty (missing measurements around interventions)
     """
 
     def __init__(self, config: RewardConfig = RewardConfig()):
         self.config = config
+        # Track which intervention events have already incurred a penalty
+        self._last_penalized_event_time: pd.Timestamp | None = None
+
+    def reset(self) -> None:
+        """Reset any episode-specific bookkeeping."""
+        self._last_penalized_event_time = None
 
     def __call__(
         self,
@@ -92,6 +106,10 @@ class SimpleReward:
         if self.config.use_uncertainty_penalty:
             reward += self._uncertainty_penalty(next_state)
 
+        # Component 5: Treatment/intervention penalty
+        if self.config.use_treatment_penalty:
+            reward += self._treatment_penalty(state, action, next_state)
+
         return reward
 
     def _uncertainty_penalty(self, state: PatientState) -> float:
@@ -124,6 +142,52 @@ class SimpleReward:
             penalty += self.config.uncertainty_variability_coeff * excess_variability
 
         return penalty
+
+    def _treatment_penalty(
+        self,
+        state: PatientState,  # noqa: ARG002 (kept for extensibility)
+        action: ActionSpec | None,
+        next_state: PatientState,
+    ) -> float:
+        """
+        Penalize not measuring around the time of insulin/treatment interventions.
+
+        Uses metadata from the next state, which encodes whether a recent bolus
+        occurred within the intervention horizon and how long ago it was.
+
+        Logic:
+        - If a recent bolus occurred within `treatment_window_minutes`
+        - AND the agent chooses not to measure (action is None or "wait"),
+          apply a significant negative reward.
+        """
+        metadata = next_state.metadata
+        recent_bolus = bool(metadata.get("recent_bolus", False))
+        if not recent_bolus:
+            return 0.0
+
+        minutes_since = metadata.get("recent_bolus_minutes", np.nan)
+        if np.isnan(minutes_since) or minutes_since > self.config.treatment_window_minutes:
+            return 0.0
+
+        # Reconstruct the timestamp of the most recent intervention event.
+        try:
+            event_time = next_state.timestamp - pd.Timedelta(minutes=float(minutes_since))
+        except Exception:
+            # If anything goes wrong computing the event time, fall back to stateless behavior.
+            event_time = None
+
+        # Ensure we only penalize once per underlying intervention event.
+        if event_time is not None and self._last_penalized_event_time is not None:
+            if event_time == self._last_penalized_event_time:
+                return 0.0
+
+        # We only penalize skipping a measurement near treatment time.
+        if action is None or action.name == "wait":
+            if event_time is not None:
+                self._last_penalized_event_time = event_time
+            return self.config.treatment_no_measure_penalty
+
+        return 0.0
 
 
 __all__ = ["RewardConfig", "SimpleReward"]

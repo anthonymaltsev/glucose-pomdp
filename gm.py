@@ -38,6 +38,8 @@ def run_policy_on_trajectory(
     # Reset any internal policy state between episodes
     if hasattr(policy, "reset"):
         policy.reset()
+    if hasattr(reward_fn, "reset"):
+        reward_fn.reset()
     state = env.reset()
 
     total_reward = 0.0
