@@ -38,10 +38,8 @@ class RewardConfig:
     uncertainty_variability_threshold: float = 50.0
 
     # Treatment/intervention monitoring penalty
-    # Penalize not measuring around the time of insulin/treatment events.
-    use_treatment_penalty: bool = True
-    treatment_window_minutes: float = 60.0
-    treatment_no_measure_penalty: float = -1000.0
+    treatment_no_measure_penalty: float = -20.0
+    treatment_window_minutes: float = 120.0
 
 
 class SimpleReward:
@@ -60,10 +58,13 @@ class SimpleReward:
         self.config = config
         # Track which intervention events have already incurred a penalty
         self._last_penalized_event_time: pd.Timestamp | None = None
+        # Track last measurement time under the evaluated policy (not historical)
+        self._last_measurement_time_policy: pd.Timestamp | None = None
 
     def reset(self) -> None:
         """Reset any episode-specific bookkeeping."""
         self._last_penalized_event_time = None
+        self._last_measurement_time_policy = None
 
     def __call__(
         self,
@@ -83,6 +84,11 @@ class SimpleReward:
             Scalar reward value
         """
         reward = 0.0
+
+        # Update policy-dependent bookkeeping: record when this policy measures.
+        if action is not None and action.name != "wait":
+            # Treat the measurement as occurring at the current decision time.
+            self._last_measurement_time_policy = state.timestamp
 
         # Component 1: Action cost (weighted to be very small)
         if action is not None:
@@ -107,8 +113,7 @@ class SimpleReward:
             reward += self._uncertainty_penalty(next_state)
 
         # Component 5: Treatment/intervention penalty
-        if self.config.use_treatment_penalty:
-            reward += self._treatment_penalty(state, action, next_state)
+        reward += self._treatment_penalty(state, action, next_state)
 
         return reward
 
@@ -145,20 +150,20 @@ class SimpleReward:
 
     def _treatment_penalty(
         self,
-        state: PatientState,  # noqa: ARG002 (kept for extensibility)
+        state: PatientState,
         action: ActionSpec | None,
         next_state: PatientState,
     ) -> float:
         """
-        Penalize not measuring around the time of insulin/treatment interventions.
-
-        Uses metadata from the next state, which encodes whether a recent bolus
-        occurred within the intervention horizon and how long ago it was.
+        Penalize not measuring BEFORE insulin/treatment interventions (prospective check).
 
         Logic:
-        - If a recent bolus occurred within `treatment_window_minutes`
-        - AND the agent chooses not to measure (action is None or "wait"),
-          apply a significant negative reward.
+        - When an intervention occurs (detected via recent_bolus in metadata)
+        - Check if there was a measurement within `treatment_window_minutes` BEFORE the intervention
+        - If no measurement before intervention, apply penalty
+        - Otherwise, no penalty (0 reward)
+
+        This encourages measuring before interventions to ensure safe treatment decisions.
         """
         metadata = next_state.metadata
         recent_bolus = bool(metadata.get("recent_bolus", False))
@@ -166,25 +171,30 @@ class SimpleReward:
             return 0.0
 
         minutes_since = metadata.get("recent_bolus_minutes", np.nan)
-        if np.isnan(minutes_since) or minutes_since > self.config.treatment_window_minutes:
+        if np.isnan(minutes_since):
+            return 0.0
+        try:
+            intervention_time = next_state.timestamp - pd.Timedelta(minutes=float(minutes_since))
+        except Exception:
             return 0.0
 
-        # Reconstruct the timestamp of the most recent intervention event.
-        try:
-            event_time = next_state.timestamp - pd.Timedelta(minutes=float(minutes_since))
-        except Exception:
-            # If anything goes wrong computing the event time, fall back to stateless behavior.
-            event_time = None
-
-        # Ensure we only penalize once per underlying intervention event.
-        if event_time is not None and self._last_penalized_event_time is not None:
-            if event_time == self._last_penalized_event_time:
+        if self._last_penalized_event_time is not None:
+            if intervention_time == self._last_penalized_event_time:
                 return 0.0
 
-        # We only penalize skipping a measurement near treatment time.
-        if action is None or action.name == "wait":
-            if event_time is not None:
-                self._last_penalized_event_time = event_time
+        # Make the penalty depend on the *policy's* measurement history, not the
+        # historical clinician measurements baked into the features.
+        if self._last_measurement_time_policy is None:
+            time_since_last_policy = np.inf
+        else:
+            time_since_last_policy = (
+                (intervention_time - self._last_measurement_time_policy).total_seconds() / 60.0
+            )
+
+        # If the policy has not measured within the configured window before
+        # the intervention, apply the penalty once for this event.
+        if time_since_last_policy > self.config.treatment_window_minutes:
+            self._last_penalized_event_time = intervention_time
             return self.config.treatment_no_measure_penalty
 
         return 0.0
