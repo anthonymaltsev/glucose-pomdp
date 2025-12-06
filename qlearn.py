@@ -118,7 +118,7 @@ class QLearner(Policy):
 
     @classmethod
     def load(cls, path: Path, device: str = "cpu") -> QLearner:
-        checkpoint = torch.load(path, map_location=device)
+        checkpoint = torch.load(path, map_location=device, weights_only=False)
         
         learner = cls(
             action_space=checkpoint['action_space'],
@@ -199,11 +199,30 @@ class QLearningTrainer:
         return features.flatten()
 
     def train(self, num_episodes: int = 100):
-        trajectories = list(self.dataset.iter_trajectories())
-        episode = 0
+        # Get trajectory identifiers first (fast - just grouping keys, no trajectory building)
+        trajectory_keys = []
+        for key, _ in self.dataset._events.groupby(["SUBJECT_ID", "HADM_ID", "ICUSTAY_ID"], sort=False):
+            trajectory_keys.append(key)
         
+        # Lazy trajectory cache - only build when accessed
+        trajectory_cache = {}
+        
+        def get_trajectory(key):
+            if key not in trajectory_cache:
+                stay_df = self.dataset._events[
+                    (self.dataset._events["SUBJECT_ID"] == key[0]) &
+                    (self.dataset._events["HADM_ID"] == key[1]) &
+                    (self.dataset._events["ICUSTAY_ID"] == key[2])
+                ]
+                trajectory_cache[key] = self.dataset._build_trajectory(stay_df.copy())
+            return trajectory_cache[key]
+        
+        episode = 0
+        print("Starting training...")
         while episode < num_episodes:
-            trajectory = np.random.choice(trajectories)
+            # Sample a trajectory identifier and build only that trajectory (with caching)
+            selected_key = trajectory_keys[np.random.randint(len(trajectory_keys))]
+            trajectory = get_trajectory(selected_key)
             env = GlucoseEnvironment(trajectory, self.reward_fn)
             
             if hasattr(self.learner, 'reset'):
@@ -295,12 +314,12 @@ def main():
         replay_capacity=10000,
         batch_size=32,
         update_freq=4,
-        checkpoint_freq=10,
+        checkpoint_freq=500,
         device=device,
     )
     
     print(f"Starting DQN training on {device}...")
-    trainer.train(num_episodes=100)
+    trainer.train(num_episodes=10000)
     print(f"Training complete. Checkpoints saved to {checkpoint_dir}")
 
 

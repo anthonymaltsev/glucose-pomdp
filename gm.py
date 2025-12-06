@@ -12,6 +12,7 @@ from policies import (
     ThresholdPolicy,
     UncertaintyPolicy,
 )
+from qlearn import QLearner
 
 
 def run_policy_on_trajectory(
@@ -95,16 +96,19 @@ def main() -> None:
 
     # Create policy factories so we can build a fresh policy per trajectory.
     print("\n3. Creating policies...")
+    qlearner = QLearner.load("checkpoints/qlearner_ep2500.pth")
+    qlearner.training = False  # Set to eval mode
     policy_factories = [
         ("Greedy (always wait)", lambda ds, traj: GreedyPolicy(ds.get_action_space())),
         # ("Threshold (4hr)", lambda ds, traj: ThresholdPolicy(time_threshold_minutes=240)),
-        # ("Threshold (2hr)", lambda ds, traj: ThresholdPolicy(time_threshold_minutes=120)),
-        # (
-        #     "Uncertainty",
-        #     lambda ds, traj: UncertaintyPolicy(std_threshold=30, time_threshold_minutes=180),
-        # ),
-        # ("Myopic VOI", lambda ds, traj: MyopicVOIPolicy(info_gain_weight=1.5)),
+        ("Threshold (2hr)", lambda ds, traj: ThresholdPolicy(time_threshold_minutes=120)),
+        (
+            "Uncertainty",
+            lambda ds, traj: UncertaintyPolicy(std_threshold=30, time_threshold_minutes=180),
+        ),
+        ("Myopic VOI", lambda ds, traj: MyopicVOIPolicy(info_gain_weight=1.5)),
         ("Historical", lambda ds, traj: HistoricalPolicy(traj)),
+        ("QLearner", lambda ds, traj: qlearner)
     ]
     print(f"   ✓ Created {len(policy_factories)} policy definitions")
 
@@ -131,6 +135,10 @@ def main() -> None:
     for trajectory in trajectory_iter:
         trajectory_count += 1
         
+        # print(*zip(trajectory.states, ["\n" for _ in trajectory.states], trajectory.actions), sep="\n\n")
+        # break
+
+
         # Run each policy on this trajectory
         for name, factory in policy_factories:
             policy = factory(dataset, trajectory)
@@ -146,8 +154,8 @@ def main() -> None:
         # Print progress every 100 iterations
         if trajectory_count % 100 == 0:
             print(f"  Processed {trajectory_count} trajectories...")
-        if trajectory_count == 100:
-            print("Stopping at 10 trajectories...")
+        if trajectory_count == 250:
+            print("Stopping at 250 trajectories...")
             break
     
     print(f"   ✓ Completed processing {trajectory_count} trajectories")
@@ -167,13 +175,6 @@ def main() -> None:
         total_measurements = sum(results['total_measurements'])
         
         print(f"{name:<25} {avg_reward:>15.2f} {total_reward:>15.2f} {avg_measurements:>18.2f} {total_measurements:>20}")
-
-    print("\n✓ Phase 1 implementation complete!")
-    print("\nYou can now:")
-    print("  - Implement custom policies by extending the Policy class")
-    print("  - Experiment with different reward parameters")
-    print("  - Run policies on different trajectories")
-    print("  - Build evaluation framework to compare across all trajectories")
 
 
 if __name__ == "__main__":

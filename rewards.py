@@ -39,7 +39,7 @@ class RewardConfig:
 
     # Treatment/intervention monitoring penalty
     treatment_no_measure_penalty: float = -20.0
-    treatment_window_minutes: float = 120.0
+    treatment_window_minutes: float = 90.0
 
 
 class SimpleReward:
