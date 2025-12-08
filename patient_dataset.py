@@ -118,6 +118,9 @@ class PatientStateDataset(Iterable[Transition]):
         default_reward: float = 0.0,
         action_resolver: Callable[[PatientState, PatientState], ActionSpec | None] | None = None,
         reward_fn: Callable[[PatientState, ActionSpec | None, PatientState], float] | None = None,
+        split: str | None = None,
+        train_test_split_ratio: float = 0.8,
+        random_seed: int = 42,
     ) -> None:
         self.csv_path = Path(csv_path)
         self.resample_freq = pd.Timedelta(resample_freq)
@@ -131,6 +134,9 @@ class PatientStateDataset(Iterable[Transition]):
         self.action_resolver = action_resolver
         self.reward_fn = reward_fn
         self._action_lookup = {action.name: action for action in self.ACTION_SPACE}
+        self.split = split  # 'train', 'test', or None for all
+        self.train_test_split_ratio = train_test_split_ratio
+        self.random_seed = random_seed
 
         if not self.csv_path.exists():
             raise FileNotFoundError(f"Dataset not found: {self.csv_path}")
@@ -140,6 +146,11 @@ class PatientStateDataset(Iterable[Transition]):
         parse_dates = [col for col in date_columns if col in header.columns]
         self._events = pd.read_csv(self.csv_path, parse_dates=parse_dates)
         self._normalize_columns()
+        
+        # Compute train/test split if needed
+        self._trajectory_keys_filter = None
+        if split is not None:
+            self._trajectory_keys_filter = self._get_split_trajectory_keys()
 
     def __iter__(self) -> Iterator[Transition]:
         for trajectory in self.iter_trajectories():
@@ -152,9 +163,44 @@ class PatientStateDataset(Iterable[Transition]):
     def get_action_space(self) -> Tuple[ActionSpec, ...]:
         return self.ACTION_SPACE
 
+    def _get_split_trajectory_keys(self) -> set:
+        """Get set of trajectory keys (SUBJECT_ID, HADM_ID, ICUSTAY_ID) for the specified split.
+        
+        Uses deterministic random seed to ensure same split every time.
+        """
+        # Get all unique trajectory keys
+        trajectory_keys = []
+        for key, _ in self._events.groupby(["SUBJECT_ID", "HADM_ID", "ICUSTAY_ID"], sort=False):
+            trajectory_keys.append(key)
+        
+        # Sort for deterministic ordering
+        trajectory_keys = sorted(trajectory_keys)
+        
+        # Use deterministic random seed for splitting
+        rng = np.random.RandomState(self.random_seed)
+        indices = np.arange(len(trajectory_keys))
+        rng.shuffle(indices)
+        
+        # Split indices
+        split_idx = int(len(trajectory_keys) * self.train_test_split_ratio)
+        train_indices = set(indices[:split_idx])
+        test_indices = set(indices[split_idx:])
+        
+        # Map back to trajectory keys
+        if self.split == "train":
+            return {trajectory_keys[i] for i in train_indices}
+        elif self.split == "test":
+            return {trajectory_keys[i] for i in test_indices}
+        else:
+            raise ValueError(f"Invalid split: {self.split}. Must be 'train' or 'test'.")
+    
     def iter_trajectories(self) -> Iterator[PatientTrajectory]:
         """Yield full trajectories for each ICU stay."""
-        for _, stay_df in self._events.groupby(["SUBJECT_ID", "HADM_ID", "ICUSTAY_ID"], sort=False):
+        for key, stay_df in self._events.groupby(["SUBJECT_ID", "HADM_ID", "ICUSTAY_ID"], sort=False):
+            # Filter by split if specified
+            if self._trajectory_keys_filter is not None:
+                if key not in self._trajectory_keys_filter:
+                    continue
             yield self._build_trajectory(stay_df.copy())
 
     def feature_names(self) -> Tuple[str, ...]:

@@ -134,7 +134,7 @@ class BehaviorCloningTrainer:
         self.checkpoint_freq = checkpoint_freq
         
         self.reward_fn = SimpleReward()
-        self.dataset = PatientStateDataset(dataset_path, reward_fn=self.reward_fn)
+        self.dataset = PatientStateDataset(dataset_path, reward_fn=self.reward_fn, split="train")
         self.action_space = self.dataset.get_action_space()
         
         self.policy = BCPolicy(
@@ -298,7 +298,7 @@ def main():
     print(f"Starting behavior cloning training on {device}...")
     # For quick iteration, use sample_fraction (e.g., 0.1 for 10% of trajectories)
     # For full training, use max_trajectories=None and sample_fraction=None
-    trainer.train(num_epochs=10000, max_trajectories=None, sample_fraction=0.1)
+    trainer.train(num_epochs=10000, max_trajectories=None)
     print(f"Training complete. Checkpoints saved to {checkpoint_dir}")
 
 

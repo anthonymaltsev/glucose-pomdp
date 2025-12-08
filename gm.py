@@ -91,8 +91,8 @@ def main() -> None:
 
     # Load dataset with reward function
     print("\n2. Loading dataset with reward function...")
-    dataset = PatientStateDataset(csv_path, reward_fn=reward_fn)
-    print(f"   ✓ Dataset loaded from {csv_path}")
+    dataset = PatientStateDataset(csv_path, reward_fn=reward_fn, split="test")
+    print(f"   ✓ Dataset loaded from {csv_path} (test split)")
 
     # Create policy factories so we can build a fresh policy per trajectory.
     print("\n3. Creating policies...")

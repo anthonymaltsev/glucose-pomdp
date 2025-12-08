@@ -110,14 +110,14 @@ class SimpleReward:
 
         # Component 4: Uncertainty penalty (VOI - encourages information gathering)
         if self.config.use_uncertainty_penalty:
-            reward += self._uncertainty_penalty(next_state)
+            reward += self._uncertainty_penalty(action, next_state)
 
         # Component 5: Treatment/intervention penalty
         reward += self._treatment_penalty(state, action, next_state)
 
         return reward
 
-    def _uncertainty_penalty(self, state: PatientState) -> float:
+    def _uncertainty_penalty(self, action: ActionSpec | None, state: PatientState) -> float:
         """
         Penalize high uncertainty about patient state.
 
@@ -126,6 +126,7 @@ class SimpleReward:
         - High glucose variability (std > 30 mg/dL)
 
         Args:
+            action: Action taken (or None)
             state: Patient state to evaluate
 
         Returns:
@@ -135,6 +136,9 @@ class SimpleReward:
 
         time_since_last = state.features[7].item()  # time_since_last_measurement_min
         glucose_std = state.features[2].item()  # glucose_std
+
+        if action is not None and action.name != "wait":
+            return 0.0
 
         # Time penalty: nonlinear after threshold (2 hours)
         if not np.isnan(time_since_last) and time_since_last > self.config.uncertainty_time_threshold:

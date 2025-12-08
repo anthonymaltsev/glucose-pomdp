@@ -63,6 +63,9 @@ class QLearner(Policy):
         state_dim = 8
         action_dim = len(action_space)
         self.q_network = QNetwork(state_dim, action_dim, hidden_dims).to(self.device)
+        self.target_network = QNetwork(state_dim, action_dim, hidden_dims).to(self.device)
+        self.target_network.load_state_dict(self.q_network.state_dict())
+        self.target_network.eval()
         self.optimizer = optim.Adam(self.q_network.parameters(), lr=learning_rate)
         self.training = True
 
@@ -92,7 +95,7 @@ class QLearner(Policy):
         current_q = self.q_network(states).gather(1, actions.unsqueeze(1)).squeeze(1)
         
         with torch.no_grad():
-            next_q = self.q_network(next_states).max(1)[0]
+            next_q = self.target_network(next_states).max(1)[0]
             target_q = rewards + self.discount * next_q * (1 - dones.float())
         
         loss = nn.MSELoss()(current_q, target_q)
@@ -102,6 +105,10 @@ class QLearner(Policy):
         self.optimizer.step()
         
         return loss.item()
+    
+    def update_target_network(self):
+        """Copy weights from main network to target network (hard update)."""
+        self.target_network.load_state_dict(self.q_network.state_dict())
 
     def reset(self) -> None:
         pass
@@ -109,6 +116,7 @@ class QLearner(Policy):
     def save(self, path: Path):
         torch.save({
             'q_network_state_dict': self.q_network.state_dict(),
+            'target_network_state_dict': self.target_network.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'action_space': self.action_space,
             'learning_rate': self.learning_rate,
@@ -128,6 +136,12 @@ class QLearner(Policy):
             device=device,
         )
         learner.q_network.load_state_dict(checkpoint['q_network_state_dict'])
+        # Load target network if it exists (for backward compatibility)
+        if 'target_network_state_dict' in checkpoint:
+            learner.target_network.load_state_dict(checkpoint['target_network_state_dict'])
+        else:
+            # If old checkpoint without target network, copy from main network
+            learner.target_network.load_state_dict(checkpoint['q_network_state_dict'])
         learner.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         return learner
 
@@ -161,6 +175,7 @@ class QLearningTrainer:
         replay_capacity: int = 10000,
         batch_size: int = 32,
         update_freq: int = 4,
+        target_update_freq: int = 100,
         checkpoint_freq: int = 10,
         device: str = "cpu",
     ):
@@ -175,10 +190,11 @@ class QLearningTrainer:
         self.epsilon_decay = epsilon_decay
         self.batch_size = batch_size
         self.update_freq = update_freq
+        self.target_update_freq = target_update_freq
         self.checkpoint_freq = checkpoint_freq
         
         self.reward_fn = SimpleReward()
-        self.dataset = PatientStateDataset(dataset_path, reward_fn=self.reward_fn)
+        self.dataset = PatientStateDataset(dataset_path, reward_fn=self.reward_fn, split="train")
         self.action_space = self.dataset.get_action_space()
         
         self.learner = QLearner(
@@ -257,6 +273,9 @@ class QLearningTrainer:
                     dones = torch.tensor([t.done for t in batch], dtype=torch.bool)
                     
                     loss = self.learner.update(states, actions, rewards, next_states, dones)
+                    
+                    if self.step_count % self.target_update_freq == 0:
+                        self.learner.update_target_network()
                 
                 state = next_state
                 self.step_count += 1
@@ -314,6 +333,7 @@ def main():
         replay_capacity=10000,
         batch_size=32,
         update_freq=4,
+        target_update_freq=100,
         checkpoint_freq=500,
         device=device,
     )
