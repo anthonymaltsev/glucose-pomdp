@@ -13,7 +13,7 @@ from policies import (
     UncertaintyPolicy,
 )
 from qlearn import QLearner
-
+from bc import BCPolicy
 
 def run_policy_on_trajectory(
     policy,
@@ -97,6 +97,7 @@ def main() -> None:
     # Create policy factories so we can build a fresh policy per trajectory.
     print("\n3. Creating policies...")
     qlearner = QLearner.load("checkpoints/qlearner_ep2500.pth")
+    bc_policy = BCPolicy.load("checkpoints/bc_policy_ep22.pth")
     qlearner.training = False  # Set to eval mode
     policy_factories = [
         ("Greedy (always wait)", lambda ds, traj: GreedyPolicy(ds.get_action_space())),
@@ -108,7 +109,8 @@ def main() -> None:
         ),
         ("Myopic VOI", lambda ds, traj: MyopicVOIPolicy(info_gain_weight=1.5)),
         ("Historical", lambda ds, traj: HistoricalPolicy(traj)),
-        ("QLearner", lambda ds, traj: qlearner)
+        ("QLearner", lambda ds, traj: qlearner),
+        ("BCPolicy", lambda ds, traj: bc_policy)
     ]
     print(f"   ✓ Created {len(policy_factories)} policy definitions")
 

@@ -16,10 +16,10 @@ class RewardConfig:
     action_cost_weight: float = 1.0  # Use raw action costs directly
 
     # Glycemic penalties
-    hypo_penalty: float = -10.0
-    hyper_penalty: float = -5.0
-    severe_hypo_penalty: float = -20.0
-    severe_hyper_penalty: float = -10.0
+    hypo_penalty: float = 0.0 #-10.0
+    hyper_penalty: float = 0.0 #-5.0
+    severe_hypo_penalty: float = 0.0 #-20.0
+    severe_hyper_penalty: float = 0.0 #-10.0
 
     # Thresholds
     hypo_threshold: float = 70.0
