@@ -70,6 +70,9 @@ def run_policy_on_trajectory(
     stats["num_measurements"] = num_measurements
     stats["num_waits"] = num_waits
     stats["action_counts"] = action_counts
+    
+    # Get reward component breakdown
+    stats["reward_breakdown"] = reward_fn.get_component_breakdown()
 
     return stats
 
@@ -97,8 +100,9 @@ def main() -> None:
     # Create policy factories so we can build a fresh policy per trajectory.
     print("\n3. Creating policies...")
     qlearner = QLearner.load("checkpoints/qlearner_ep2500.pth")
-    bc_policy = BCPolicy.load("checkpoints/bc_policy_ep22.pth")
+    bc_policy = BCPolicy.load("checkpoints/bc_policy_ep8.pth")
     qlearner.training = False  # Set to eval mode
+    # bc_policy.training = False  # keep in train mode for now so that it performs like a stochastic policy
     policy_factories = [
         ("Greedy (always wait)", lambda ds, traj: GreedyPolicy(ds.get_action_space())),
         # ("Threshold (4hr)", lambda ds, traj: ThresholdPolicy(time_threshold_minutes=240)),
@@ -126,6 +130,13 @@ def main() -> None:
             "total_waits": [],
             "episode_lengths": [],
             "avg_rewards": [],
+            "reward_components": {
+                "action_cost": [],
+                "glycemic_penalty": [],
+                "time_in_range": [],
+                "uncertainty_penalty": [],
+                "treatment_penalty": [],
+            },
         }
         for name, _ in policy_factories
     }
@@ -137,10 +148,10 @@ def main() -> None:
     for trajectory in trajectory_iter:
         trajectory_count += 1
         
-        # print(*zip(trajectory.states, ["\n" for _ in trajectory.states], trajectory.actions), sep="\n\n")
-        # break
-
-
+        # Verify trajectory structure: should have len(states) - 1 actions
+        if len(trajectory.actions) != len(trajectory.states) - 1:
+            print(f"WARNING: Trajectory {trajectory_count} has {len(trajectory.states)} states but {len(trajectory.actions)} actions (expected {len(trajectory.states) - 1})")
+        
         # Run each policy on this trajectory
         for name, factory in policy_factories:
             policy = factory(dataset, trajectory)
@@ -152,12 +163,19 @@ def main() -> None:
             policy_results[name]['total_waits'].append(stats['num_waits'])
             policy_results[name]['episode_lengths'].append(stats['length'])
             policy_results[name]['avg_rewards'].append(stats['avg_reward'])
+            
+            # Accumulate reward component breakdown
+            breakdown = stats.get('reward_breakdown', {})
+            for component in policy_results[name]['reward_components']:
+                policy_results[name]['reward_components'][component].append(
+                    breakdown.get(component, 0.0)
+                )
         
         # Print progress every 100 iterations
         if trajectory_count % 100 == 0:
             print(f"  Processed {trajectory_count} trajectories...")
-        if trajectory_count == 250:
-            print("Stopping at 250 trajectories...")
+        if trajectory_count == 100:
+            print("Stopping at 100 trajectories...")
             break
     
     print(f"   ✓ Completed processing {trajectory_count} trajectories")
@@ -177,6 +195,25 @@ def main() -> None:
         total_measurements = sum(results['total_measurements'])
         
         print(f"{name:<25} {avg_reward:>15.2f} {total_reward:>15.2f} {avg_measurements:>18.2f} {total_measurements:>20}")
+    
+    # Reward component breakdown
+    print("\n" + "=" * 60)
+    print("Reward Component Breakdown (Average per Trajectory)")
+    print("=" * 60)
+    print(f"{'Policy':<25} {'Action Cost':>15} {'Uncertainty':>15} {'Treatment':>15} {'Time-in-Range':>15} {'Glycemic':>15}")
+    print("-" * 100)
+    
+    for name, _ in policy_factories:
+        results = policy_results[name]
+        components = results['reward_components']
+        
+        avg_action_cost = sum(components['action_cost']) / len(components['action_cost']) if components['action_cost'] else 0.0
+        avg_uncertainty = sum(components['uncertainty_penalty']) / len(components['uncertainty_penalty']) if components['uncertainty_penalty'] else 0.0
+        avg_treatment = sum(components['treatment_penalty']) / len(components['treatment_penalty']) if components['treatment_penalty'] else 0.0
+        avg_tir = sum(components['time_in_range']) / len(components['time_in_range']) if components['time_in_range'] else 0.0
+        avg_glycemic = sum(components['glycemic_penalty']) / len(components['glycemic_penalty']) if components['glycemic_penalty'] else 0.0
+        
+        print(f"{name:<25} {avg_action_cost:>15.2f} {avg_uncertainty:>15.2f} {avg_treatment:>15.2f} {avg_tir:>15.2f} {avg_glycemic:>15.2f}")
 
 
 if __name__ == "__main__":

@@ -295,9 +295,9 @@ class QLearningTrainer:
 
     def save_checkpoint(self, episode: int, final: bool = False):
         if final:
-            path = self.checkpoint_dir / "qlearner_final.pth"
+            path = self.checkpoint_dir / "qlearner_fixed_final.pth"
         else:
-            path = self.checkpoint_dir / f"qlearner_ep{episode}.pth"
+            path = self.checkpoint_dir / f"qlearner_fixed_ep{episode}.pth"
         
         self.learner.save(path)
         
@@ -333,7 +333,7 @@ def main():
         replay_capacity=10000,
         batch_size=32,
         update_freq=4,
-        target_update_freq=100,
+        target_update_freq=64,
         checkpoint_freq=500,
         device=device,
     )

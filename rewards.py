@@ -28,10 +28,10 @@ class RewardConfig:
     severe_hyper_threshold: float = 250.0
 
     # Time-in-range
-    tir_hourly_rate: float = 1.0
+    tir_hourly_rate: float = 0.0
 
     # Uncertainty penalty (VOI component)
-    use_uncertainty_penalty: bool = True
+    use_uncertainty_penalty: bool = False
     uncertainty_time_threshold: float = 120.0  # 2 hours in minutes
     uncertainty_time_coeff: float = -2.0  # Stronger penalty for staleness
     uncertainty_variability_coeff: float = -1.0  # Stronger penalty for variability
@@ -60,11 +60,30 @@ class SimpleReward:
         self._last_penalized_event_time: pd.Timestamp | None = None
         # Track last measurement time under the evaluated policy (not historical)
         self._last_measurement_time_policy: pd.Timestamp | None = None
+        # Track reward components for breakdown
+        self._component_totals = {
+            "action_cost": 0.0,
+            "glycemic_penalty": 0.0,
+            "time_in_range": 0.0,
+            "uncertainty_penalty": 0.0,
+            "treatment_penalty": 0.0,
+        }
 
     def reset(self) -> None:
         """Reset any episode-specific bookkeeping."""
         self._last_penalized_event_time = None
         self._last_measurement_time_policy = None
+        self._component_totals = {
+            "action_cost": 0.0,
+            "glycemic_penalty": 0.0,
+            "time_in_range": 0.0,
+            "uncertainty_penalty": 0.0,
+            "treatment_penalty": 0.0,
+        }
+
+    def get_component_breakdown(self) -> dict:
+        """Get breakdown of reward components for the current episode."""
+        return self._component_totals.copy()
 
     def __call__(
         self,
@@ -91,29 +110,43 @@ class SimpleReward:
             self._last_measurement_time_policy = state.timestamp
 
         # Component 1: Action cost (weighted to be very small)
+        action_cost = 0.0
         if action is not None:
-            reward -= action.cost * self.config.action_cost_weight
+            action_cost = -action.cost * self.config.action_cost_weight
+            reward += action_cost
+        self._component_totals["action_cost"] += action_cost
 
         # Component 2: Glycemic penalty (when measurement available)
+        glycemic_penalty = 0.0
         glucose = next_state.metadata.get("measurement_value", np.nan)
         if not np.isnan(glucose):
             if glucose < self.config.hypo_threshold:
-                reward += self.config.hypo_penalty  # -10.0
+                glycemic_penalty = self.config.hypo_penalty  # -10.0
             elif glucose > self.config.hyper_threshold:
-                reward += self.config.hyper_penalty  # -5.0
+                glycemic_penalty = self.config.hyper_penalty  # -5.0
+            reward += glycemic_penalty
+        self._component_totals["glycemic_penalty"] += glycemic_penalty
 
         # Component 3: Time-in-range reward (dense positive signal)
+        tir_reward = 0.0
         time_delta = (next_state.timestamp - state.timestamp).total_seconds() / 3600
         tir = next_state.features[6].item()  # time_in_range_frac feature
         if not np.isnan(tir):
-            reward += tir * time_delta * self.config.tir_hourly_rate
+            tir_reward = tir * time_delta * self.config.tir_hourly_rate
+            reward += tir_reward
+        self._component_totals["time_in_range"] += tir_reward
 
         # Component 4: Uncertainty penalty (VOI - encourages information gathering)
+        uncertainty_penalty = 0.0
         if self.config.use_uncertainty_penalty:
-            reward += self._uncertainty_penalty(action, next_state)
+            uncertainty_penalty = self._uncertainty_penalty(action, next_state)
+            reward += uncertainty_penalty
+        self._component_totals["uncertainty_penalty"] += uncertainty_penalty
 
         # Component 5: Treatment/intervention penalty
-        reward += self._treatment_penalty(state, action, next_state)
+        treatment_penalty = self._treatment_penalty(state, action, next_state)
+        reward += treatment_penalty
+        self._component_totals["treatment_penalty"] += treatment_penalty
 
         return reward
 
